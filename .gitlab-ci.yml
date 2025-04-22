@@ -1,0 +1,142 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+      variables:
+        ENVIRONMENT: "dev"
+    - if: $CI_COMMIT_REF_NAME == "release/stage"
+      variables:
+        ENVIRONMENT: "stage"
+    - if: $CI_COMMIT_REF_NAME == "release/live"
+      variables:
+        ENVIRONMENT: "live"
+
+detect:version:
+  stage: .pre
+  script:
+    - FRONTEND_VERSION=$(jq -r .version frontend/package.json)
+    - BACKEND_VERSION=$(jq -r .version backend/package.json)
+    - echo "VERSION=$vfe-${FRONTEND_VERSION}-be-${BACKEND_VERSION}" >> version.env
+  artifacts:
+    reports:
+      dotenv: version.env
+
+build:backend:
+  stage: build
+  needs: ["detect:version"]
+  script:
+    - cd backend
+    - docker build -t myacr.azurecr.io/backend:$VERSION .
+    - echo $AZURE_ACR_PASSWORD | docker login myacr.azurecr.io -u $AZURE_ACR_USERNAME --password-stdin
+    - docker push myacr.azurecr.io/backend:$VERSION
+  rules:
+    - changes:
+        - backend/**/*
+
+get:backend-url:
+  stage: deploy
+  needs: ["tofu:apply"]
+  script:
+    - cd terraform
+    - BACKEND_URL=$(tofu output -raw backend_url)
+    - echo "Using backend URL $BACKEND_URL"
+    - echo "VUE_APP_API_URL=$BACKEND_URL" > ../frontend/.env
+  artifacts:
+    paths:
+      - frontend/.env
+
+build:frontend:
+  stage: build
+  needs: ["get:backend-url"]
+  script:
+    - cd frontend
+    - npm ci
+    - npm run build
+  artifacts:
+    paths:
+      - frontend/dist/
+  rules:
+    - changes:
+        - frontend/**/*
+
+tofu:init:
+  stage: deploy
+  script:
+    - cd terraform
+    - tofu init
+
+tofu:plan:
+  stage: deploy
+  variables:
+    TF_VAR_service_version: $VERSION
+  script:
+    - cd terraform
+    - tofu plan -var-file=${ENVIRONMENT}.tfvars
+
+release:
+  environment:
+    name: $ENVIRONMENT
+  stage: detect
+  needs: ["detect:version"]
+  script:
+    - echo "Check if release should be created..."
+    - git fetch --tags 2> /dev/null
+    - LATEST_TAG=$(git tag | grep -w $VERSION || true)
+    - | # Check if the tag already exists for this version & git diff is empty
+      CHANGED_FRONTEND=$(git diff --quiet $LATEST_TAG HEAD -- frontend/)
+      CHANGED_BACKEND=$(git diff $LATEST_TAG HEAD -- backend/)
+
+      RELEASE_NAME="vfe-$FRONTEND_VERSION-be-$BACKEND_VERSION"
+    - |
+      if [ -z "$CHANGED_FRONTEND" ] && [ -z "$CHANGED_BACKEND" ]; then
+        echo "No changes detected. Exiting."
+        exit 0
+      else
+        echo "No existing tag found. Creating release tag ${RELEASE_NAME}"
+        git tag $RELEASE_NAME
+        git push origin $RELEASE_NAME
+      fi
+
+tofu:apply:
+  environment:
+    name: $ENVIRONMENT
+  stage: deploy
+  variables:
+    TF_VAR_service_version: $VERSION
+  script:
+    - cd terraform
+    - tofu apply -auto-approve -var-file=${ENVIRONMENT}.tfvars
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_REF_NAME == "release/stage"'
+      when: manual
+    - if: '$CI_COMMIT_REF_NAME == "release/live"'
+      when: manual
+    - when: never
+
+deploy:frontend:
+  stage: deploy
+  image: mcr.microsoft.com/azure-cli
+  environment:
+    name: $ENVIRONMENT
+  variables:
+    APP_NAME: "spa-prodyna"
+  needs: ["build:frontend"]
+  script:
+    - cd frontend
+    - echo "Logging into Azure..."
+    - az login --service-principal \
+        --username $AZURE_CLIENT_ID \
+        --password $AZURE_CLIENT_SECRET \
+        --tenant $AZURE_TENANT_ID
+    - echo "Deploying to Azure Static Web App..."
+    - az staticwebapp upload \
+        --name ${APP_NAME}-${ENVIRONMENT}-frontend \
+        --resource-group ${APP_NAME}-${ENVIRONMENT}-rg \
+        --source dist/
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_REF_NAME == "release/stage"'
+      when: manual
+    - if: '$CI_COMMIT_REF_NAME == "release/live"'
+      when: manual
+    - when: never
