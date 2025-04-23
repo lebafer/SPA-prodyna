@@ -73,3 +73,9 @@ resource "azurerm_linux_web_app" "backend" {
     DOCKER_REGISTRY_SERVER_PASSWORD     = azurerm_container_registry.acr.admin_password
   }
 }
+
+resource "azurerm_static_site" "frontend" {
+  name                = "${var.app_name}-${var.environment}-frontend"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = var.location
+}
